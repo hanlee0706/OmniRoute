@@ -22,11 +22,16 @@ test("entrypoint runs the docker basePath guard before the server starts", () =>
   assert.match(entrypoint, /docker\/ensure-docker-base-path\.mjs/);
 });
 
+test("entrypoint repairs Railway volume ownership before dropping to node", () => {
+  const entrypoint = fs.readFileSync(path.join(REPO_ROOT, "scripts/check-permissions.sh"), "utf8");
+
+  assert.match(entrypoint, /if \[ "\$\(id -u\)" -eq 0 \]/);
+  assert.match(entrypoint, /chown -R node:node \/app\/data/);
+  assert.match(entrypoint, /exec setpriv --reuid=1000 --regid=1000 --init-groups -- "\$0" "\$@"/);
+});
+
 test("Hard Rule #13: shell basePath helpers never interpolate into sed/awk", () => {
-  const shellFiles = [
-    "scripts/check-permissions.sh",
-    "scripts/docker/patch-basepath.sh",
-  ];
+  const shellFiles = ["scripts/check-permissions.sh", "scripts/docker/patch-basepath.sh"];
   for (const rel of shellFiles) {
     const source = fs.readFileSync(path.join(REPO_ROOT, rel), "utf8");
     assert.doesNotMatch(
@@ -41,10 +46,7 @@ test("Hard Rule #13: shell basePath helpers never interpolate into sed/awk", () 
     );
   }
 
-  const patcher = fs.readFileSync(
-    path.join(REPO_ROOT, "scripts/docker/patch-basepath.sh"),
-    "utf8"
-  );
+  const patcher = fs.readFileSync(path.join(REPO_ROOT, "scripts/docker/patch-basepath.sh"), "utf8");
   assert.match(patcher, /exec node .*ensure-docker-base-path\.mjs/);
   assert.match(patcher, /Hard Rule #13/);
 
