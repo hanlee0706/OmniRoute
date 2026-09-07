@@ -1,0 +1,1 @@
+- **fix(docker):** Pin and checksum the compatible TLS client native binary and preload its runtime cache for reliable builds and cold starts ([#1](https://github.com/hanlee0706/OmniRoute/pull/1)) — thanks @hanlee0706.
