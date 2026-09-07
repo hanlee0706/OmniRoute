@@ -73,17 +73,32 @@ RUN test -f package-lock.json \
 # better-sqlite3 above, that script never throws on failure — it only
 # `console.warn`s and exits 0 — so a rate-limited or offline build would
 # otherwise succeed silently with an empty bin/ and only fail at first request
-# in production (TlsClientUnavailableError, #7802). Run it explicitly here so
-# a broken/rate-limited fetch fails the BUILD loudly instead of shipping a
-# broken image.
+# in production (TlsClientUnavailableError, #7802). Pin the native release:
+# v1.16.0 ships only xgo-named assets, which tls-client-node@0.2.0 cannot find.
+# v1.15.1 still supplies its expected filenames. Verify the exact Linux asset
+# against the SHA-256 published at:
+# https://github.com/bogdanfinn/tls-client/releases/tag/v1.15.1
+# Missing, empty, or corrupt binaries must still fail the build.
 RUN --mount=type=cache,id=s/6745642b-69a4-4535-b2b4-b338c565fa32-/root/.npm,target=/root/.npm \
   npm ci --no-audit --no-fund --legacy-peer-deps --ignore-scripts \
   && (cd node_modules/better-sqlite3 \
       && node /usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js rebuild) \
   && node -e "require('better-sqlite3')(':memory:').close()" \
-  && node node_modules/tls-client-node/scripts/postinstall.js \
-  && (test -n "$(find node_modules/tls-client-node/bin -mindepth 1 -print -quit 2>/dev/null)" \
-      || (echo "tls-client-node native binary missing after postinstall — GitHub API fetch likely rate-limited or failed (#7802)" >&2 && exit 1))
+  && TLS_CLIENT_VERSION=1.15.1 node node_modules/tls-client-node/scripts/postinstall.js \
+  && (case "$(node -p process.arch)" in \
+        x64) tls_asset=tls-client-linux-ubuntu-amd64-1.15.1.so; \
+             tls_sha256=e393e866060e238bc36509f853293cebf5af8286aede59814462693efb603b1e ;; \
+        arm64) tls_asset=tls-client-linux-arm64-1.15.1.so; \
+               tls_sha256=048b75c4fb0898a306228198d545eece39a7d5348200487f0395fbdc4168fe39 ;; \
+        *) echo "Unsupported tls-client-node Docker architecture" >&2; exit 1 ;; \
+      esac \
+      && test -f "node_modules/tls-client-node/bin/$tls_asset" \
+      && test -s "node_modules/tls-client-node/bin/$tls_asset" \
+      && echo "$tls_sha256  node_modules/tls-client-node/bin/$tls_asset" | sha256sum -c - \
+      && mkdir -p /opt/omniroute-tls/bin \
+      && cp "node_modules/tls-client-node/bin/$tls_asset" "/opt/omniroute-tls/bin/$tls_asset" \
+      && echo "$tls_sha256  $tls_asset" > /opt/omniroute-tls/SHA256SUMS \
+      || (echo "tls-client-node native binary missing or invalid after postinstall (#7802)" >&2 && exit 1))
 
 # Build with Turbopack (stable in Next 16, the repo default). The v3.8.27-era
 # TurbopackInternalError panic ("entered unreachable code: there must be a path to a
@@ -160,6 +175,101 @@ COPY --from=builder /app/.build/next/standalone ./
 # Next.js tracing. bootstrap-env requires SQLite BEFORE the standalone server
 # starts, so guarantee the complete package independent of trace behaviour.
 COPY --from=builder /app/node_modules/better-sqlite3 ./node_modules/better-sqlite3
+# Keep the verified native asset outside /app/data, which a mounted volume hides.
+# /opt stays root-owned; the non-root entrypoint seeds the actual writable cache.
+COPY --from=builder /opt/omniroute-tls /opt/omniroute-tls
+# Reuse the application's exact DATA_DIR / legacy-home / XDG resolution logic.
+# The image's Node 26 runtime supports this standalone TypeScript module natively.
+COPY --from=builder /app/src/lib/dataPaths.ts /opt/omniroute-tls/dataPaths.ts
+COPY --chmod=644 <<'TLS_CACHE_SCRIPT' /opt/omniroute-tls/prepare-cache.mjs
+import { createHash } from "node:crypto";
+import {
+  lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
+  renameSync, rmSync, writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
+import { resolveDataDir } from "./dataPaths.ts";
+
+const prefixes = {
+  x64: "tls-client-linux-ubuntu-amd64-",
+  arm64: "tls-client-linux-arm64-",
+};
+const prefix = prefixes[process.arch];
+if (process.platform !== "linux" || !prefix) {
+  throw new Error("Unsupported tls-client-node Docker platform/architecture");
+}
+const asset = `${prefix}1.15.1.so`;
+const manifest = readFileSync(new URL("./SHA256SUMS", import.meta.url), "utf8").trim();
+const [expectedHash, manifestAsset, extraField] = manifest.split(/\s+/);
+if (extraField || !/^[a-f0-9]{64}$/.test(expectedHash) || manifestAsset !== asset) {
+  throw new Error("Invalid tls-client-node image checksum manifest");
+}
+const source = new URL(`./bin/${asset}`, import.meta.url);
+if (!lstatSync(source).isFile()) {
+  throw new Error("tls-client-node image binary is not a regular file");
+}
+const bytes = readFileSync(source);
+const sha256 = (content) => createHash("sha256").update(content).digest("hex");
+if (!bytes.length || sha256(bytes) !== expectedHash) {
+  throw new Error("tls-client-node image binary checksum mismatch");
+}
+
+const dataDir = resolveDataDir();
+mkdirSync(dataDir, { recursive: true });
+const cacheDir = join(dataDir, "tls-client", "bin");
+for (const dir of [join(dataDir, "tls-client"), cacheDir]) {
+  try {
+    mkdirSync(dir);
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+  }
+  if (!lstatSync(dir).isDirectory()) {
+    throw new Error("tls-client-node cache path must be a directory, not a symlink");
+  }
+}
+// tls-client-node@0.2.0 selects the lexically last matching cache filename.
+// Preserve existing files, but never let a different asset win over the image pin.
+function assertPinnedSelection() {
+  const candidates = readdirSync(cacheDir)
+    .filter((name) => name.startsWith(prefix) && name.endsWith(".so"));
+  if ([...candidates, asset].sort().at(-1) !== asset) {
+    throw new Error("Conflicting tls-client-node cache version; refusing an unverified binary");
+  }
+}
+assertPinnedSelection();
+const destination = join(cacheDir, asset);
+try {
+  if (!lstatSync(destination).isFile()) {
+    throw new Error("tls-client-node cache binary must be a regular file, not a symlink");
+  }
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
+// Atomic replacement repairs corrupt/empty copies and avoids partially-written
+// libraries on cold starts or concurrent starts sharing the same data volume.
+const staging = mkdtempSync(join(cacheDir, ".image-binary-"));
+try {
+  const temporary = join(staging, asset);
+  writeFileSync(temporary, bytes, { mode: 0o755, flag: "wx" });
+  renameSync(temporary, destination);
+} finally {
+  rmSync(staging, { recursive: true, force: true });
+}
+assertPinnedSelection();
+if (sha256(readFileSync(destination)) !== expectedHash) {
+  throw new Error("tls-client-node cache binary checksum mismatch");
+}
+// Hand the normalized path to the child so bootstrap and provider resolution
+// cannot diverge on whitespace, relative paths, or an empty DATA_DIR override.
+console.log(dataDir);
+TLS_CACHE_SCRIPT
+COPY --chmod=755 <<'TLS_CACHE_ENTRYPOINT' /opt/omniroute-tls/start.sh
+#!/bin/sh
+set -eu
+DATA_DIR="$(node /opt/omniroute-tls/prepare-cache.mjs)" || exit 1
+export DATA_DIR
+exec "$@"
+TLS_CACHE_ENTRYPOINT
 # migrations land at <standalone>/migrations via assembleStandalone; point the runtime at them.
 ENV OMNIROUTE_MIGRATIONS_DIR=/app/migrations
 
@@ -180,7 +290,9 @@ USER node
 
 # Warns if the mounted data volume has wrong ownership
 COPY --chmod=755 scripts/check-permissions.sh /tmp/check-permissions.sh
-ENTRYPOINT ["/tmp/check-permissions.sh"]
+# check-permissions.sh repairs the default volume (when root) and drops to node
+# BEFORE start.sh verifies/seeds the cache. Both wrappers preserve CMD and signals.
+ENTRYPOINT ["/tmp/check-permissions.sh", "/opt/omniroute-tls/start.sh"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD ["node", "healthcheck.mjs"]
